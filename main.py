@@ -3,6 +3,7 @@
 Simple Bluetooth Detection Loop with Home Assistant Integration
 Every 3 seconds: check if device is available and update Home Assistant
 Added: AWAY_TIMEOUT feature to prevent immediate "away" status
+Enhanced: Added "everybody home" and "nobody home" binary sensors
 """
 
 import subprocess
@@ -40,6 +41,11 @@ AWAY_TIMEOUT_MINUTES = int(os.getenv("AWAY_TIMEOUT", "5"))  # Default 5 minutes
 # Home Assistant entity IDs for each device (will be created as binary_sensors)
 # Format: binary_sensor.bluetooth_device_name
 HA_ENTITY_PREFIX = "binary_sensor.bluetooth_"
+
+# Group sensor entity IDs
+HA_EVERYBODY_HOME_ENTITY = "binary_sensor.bluetooth_everybody_home"
+HA_NOBODY_HOME_ENTITY = "binary_sensor.bluetooth_nobody_home"
+HA_ANYBODY_HOME_ENTITY = "binary_sensor.bluetooth_anybody_home"
 
 # Global status for health checks
 # Device tracking for timeout functionality
@@ -111,6 +117,85 @@ class HomeAssistantClient:
         except Exception as e:
             logger.error(f"Error updating Home Assistant state: {e}")
             return False
+
+    def update_group_sensors(self):
+        """Update the everybody home, nobody home, and anybody home binary sensors"""
+        # Get current states
+        present_devices = [name for name, state in device_reported_states.items() if state]
+        total_devices = len(PHONE_MACS)
+        present_count = len(present_devices)
+        
+        everybody_home = present_count == total_devices and total_devices > 0
+        nobody_home = present_count == 0
+        anybody_home = present_count > 0
+        
+        # Common attributes for all group sensors
+        common_attributes = {
+            "device_class": "presence",
+            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "bluetooth_detection",
+            "total_devices": total_devices,
+            "present_devices": present_count,
+            "present_device_list": present_devices,
+            "away_timeout_minutes": AWAY_TIMEOUT_MINUTES,
+        }
+        
+        # Update everybody home sensor
+        everybody_payload = {
+            "state": everybody_home,
+            "attributes": {
+                **common_attributes,
+                "friendly_name": "Everybody Home",
+            },
+        }
+        
+        # Update nobody home sensor
+        nobody_payload = {
+            "state": nobody_home,
+            "attributes": {
+                **common_attributes,
+                "friendly_name": "Nobody Home",
+            },
+        }
+        
+        # Update anybody home sensor
+        anybody_payload = {
+            "state": anybody_home,
+            "attributes": {
+                **common_attributes,
+                "friendly_name": "Anybody Home",
+            },
+        }
+        
+        # Send updates to Home Assistant
+        success = True
+        
+        sensors_to_update = [
+            (HA_EVERYBODY_HOME_ENTITY, everybody_payload, "everybody home"),
+            (HA_NOBODY_HOME_ENTITY, nobody_payload, "nobody home"),
+            (HA_ANYBODY_HOME_ENTITY, anybody_payload, "anybody home"),
+        ]
+        
+        for entity_id, payload, sensor_name in sensors_to_update:
+            try:
+                response = requests.post(
+                    f"{self.url}/api/states/{entity_id}",
+                    json=payload,
+                    headers=self.headers,
+                    timeout=5,
+                )
+                
+                if response.status_code in [200, 201]:
+                    logger.debug(f"Updated {entity_id} to {payload['state']}")
+                else:
+                    logger.error(f"Failed to update {entity_id}: {response.status_code}")
+                    success = False
+                    
+            except Exception as e:
+                logger.error(f"Error updating {sensor_name} sensor: {e}")
+                success = False
+            
+        return success
 
     def send_event(self, event_type: str, event_data: Dict):
         """Send custom event to Home Assistant"""
@@ -253,14 +338,21 @@ def update_device_tracking(detected_devices: List[str]):
 
 def update_home_assistant_states(ha_client: HomeAssistantClient):
     """Update all device states in Home Assistant based on current tracked states"""
+    # Update individual device states
     for device_name, is_present in device_reported_states.items():
         ha_client.update_device_state(device_name, is_present)
+    
+    # Update group sensors
+    ha_client.update_group_sensors()
 
 
 def handle_state_changes(
     ha_client: HomeAssistantClient, devices_arrived: List[str], devices_left: List[str]
 ):
     """Handle state changes and notify Home Assistant"""
+    
+    # Track if we need to send group events
+    group_state_changed = len(devices_arrived) > 0 or len(devices_left) > 0
 
     # Send events for arrivals
     for device in devices_arrived:
@@ -286,8 +378,52 @@ def handle_state_changes(
             f"🔴 Device left: {device} (after {AWAY_TIMEOUT_MINUTES} minute timeout)"
         )
 
-    # Update all device states in HA
+    # Update all device states in HA (including group sensors)
     update_home_assistant_states(ha_client)
+    
+    # Send group events if state changed
+    if group_state_changed:
+        present_devices = [name for name, state in device_reported_states.items() if state]
+        total_devices = len(PHONE_MACS)
+        present_count = len(present_devices)
+        
+        everybody_home = present_count == total_devices and total_devices > 0
+        nobody_home = present_count == 0
+        anybody_home = present_count > 0
+        
+        if everybody_home:
+            event_data = {
+                "action": "everybody_home",
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "present_devices": present_devices,
+                "total_devices": total_devices,
+            }
+            ha_client.send_event("bluetooth_everybody_home", event_data)
+            logger.info("🏠 Everybody is now home!")
+            
+        elif nobody_home:
+            event_data = {
+                "action": "nobody_home", 
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_devices": total_devices,
+            }
+            ha_client.send_event("bluetooth_nobody_home", event_data)
+            logger.info("🚪 Nobody is home now!")
+            
+        # Send anybody home event (this will be true whenever someone arrives and nobody was home)
+        if anybody_home and devices_arrived:
+            # Check if we transitioned from nobody home to somebody home
+            previous_count = present_count - len(devices_arrived) + len(devices_left)
+            if previous_count == 0:
+                event_data = {
+                    "action": "anybody_home",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "present_devices": present_devices,
+                    "first_person_home": devices_arrived[0] if devices_arrived else None,
+                    "total_devices": total_devices,
+                }
+                ha_client.send_event("bluetooth_anybody_home", event_data)
+                logger.info(f"👋 First person home: {devices_arrived[0]}!")
 
 
 def main():
