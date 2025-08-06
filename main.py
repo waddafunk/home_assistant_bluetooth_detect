@@ -2,6 +2,7 @@
 """
 Simple Bluetooth Detection Loop with Home Assistant Integration
 Every 3 seconds: check if device is available and update Home Assistant
+Added: AWAY_TIMEOUT feature to prevent immediate "away" status
 """
 
 import subprocess
@@ -9,7 +10,7 @@ import time
 import logging
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict
 
 import requests
@@ -33,13 +34,17 @@ PHONE_MACS = json.loads(os.getenv("PHONE_MACS"))
 HA_URL = os.getenv("HA_URL", "http://localhost:8123")  # Default to localhost if not set
 HA_TOKEN = os.getenv("HA_TOKEN")  # Long-lived access token from Home Assistant
 
+# Away timeout configuration (in minutes)
+AWAY_TIMEOUT_MINUTES = int(os.getenv("AWAY_TIMEOUT", "5"))  # Default 5 minutes
+
 # Home Assistant entity IDs for each device (will be created as binary_sensors)
 # Format: binary_sensor.bluetooth_device_name
 HA_ENTITY_PREFIX = "binary_sensor.bluetooth_"
 
-
 # Global status for health checks
-
+# Device tracking for timeout functionality
+device_last_seen = {}  # Track when each device was last detected
+device_reported_states = {}  # Track what we last reported to HA for each device
 
 
 class HomeAssistantClient:
@@ -82,6 +87,7 @@ class HomeAssistantClient:
                 "friendly_name": f"{device_name} Presence",
                 "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "source": "bluetooth_detection",
+                "away_timeout_minutes": AWAY_TIMEOUT_MINUTES,
             },
         }
 
@@ -171,53 +177,114 @@ def devices_available() -> List[str]:
     return devices_found
 
 
-def update_home_assistant_states(
-    ha_client: HomeAssistantClient, current_devices: List[str]
-):
-    """Update all device states in Home Assistant"""
-    all_devices = list(PHONE_MACS.keys())
+def update_device_tracking(detected_devices: List[str]):
+    """Update device tracking with timeout logic"""
+    global device_last_seen, device_reported_states
+    
+    current_time = datetime.now()
+    timeout_delta = timedelta(minutes=AWAY_TIMEOUT_MINUTES)
+    
+    # Update last seen time for detected devices
+    for device in detected_devices:
+        device_last_seen[device] = current_time
+        
+    # Initialize tracking for devices we haven't seen before
+    for device in PHONE_MACS.keys():
+        if device not in device_last_seen:
+            # For new devices, consider them as "away" initially
+            device_last_seen[device] = current_time - timeout_delta - timedelta(seconds=1)
+        if device not in device_reported_states:
+            device_reported_states[device] = False  # Start as away
+    
+    # Determine current presence status for each device
+    devices_to_report_present = []
+    devices_to_report_away = []
+    
+    for device in PHONE_MACS.keys():
+        last_seen = device_last_seen.get(device)
+        time_since_seen = current_time - last_seen if last_seen else timeout_delta + timedelta(seconds=1)
+        
+        # Device is considered present if detected recently
+        is_currently_present = device in detected_devices
+        
+        # Device should be reported as present if:
+        # 1. It's currently detected, OR
+        # 2. It was detected within the timeout period
+        should_report_present = is_currently_present or time_since_seen <= timeout_delta
+        
+        # Check if we need to update the reported state
+        last_reported_state = device_reported_states.get(device, False)
+        
+        if should_report_present and not last_reported_state:
+            # Device should be marked as present (arrival)
+            devices_to_report_present.append(device)
+            device_reported_states[device] = True
+            logger.info(f"Device {device} marked as PRESENT")
+            
+        elif not should_report_present and last_reported_state:
+            # Device should be marked as away (departure after timeout)
+            devices_to_report_away.append(device)
+            device_reported_states[device] = False
+            time_away = time_since_seen.total_seconds() / 60  # Convert to minutes
+            logger.info(f"Device {device} marked as AWAY (not seen for {time_away:.1f} minutes)")
+            
+        elif is_currently_present and should_report_present:
+            # Device is still present (no state change needed, but log detection)
+            logger.debug(f"Device {device} still present")
+            
+        elif not should_report_present:
+            # Device is still away but within timeout period
+            if time_since_seen <= timeout_delta:
+                time_away = time_since_seen.total_seconds() / 60
+                logger.debug(f"Device {device} not detected for {time_away:.1f} minutes (within {AWAY_TIMEOUT_MINUTES} min timeout)")
+    
+    return devices_to_report_present, devices_to_report_away
 
-    for device_name in all_devices:
-        is_present = device_name in current_devices
+
+def update_home_assistant_states(ha_client: HomeAssistantClient):
+    """Update all device states in Home Assistant based on current tracked states"""
+    for device_name, is_present in device_reported_states.items():
         ha_client.update_device_state(device_name, is_present)
 
 
-def handle_state_change(
-    ha_client: HomeAssistantClient, previous: List[str], current: List[str]
+def handle_state_changes(
+    ha_client: HomeAssistantClient, 
+    devices_arrived: List[str], 
+    devices_left: List[str]
 ):
     """Handle state changes and notify Home Assistant"""
-    # Find devices that arrived and left
-    arrived = set(current) - set(previous)
-    left = set(previous) - set(current)
-
+    
     # Send events for arrivals
-    for device in arrived:
+    for device in devices_arrived:
         event_data = {
             "device": device,
             "action": "arrived",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timeout_minutes": AWAY_TIMEOUT_MINUTES,
         }
         ha_client.send_event("bluetooth_device_arrived", event_data)
-        logger.info(f"Device arrived: {device}")
+        logger.info(f"🟢 Device arrived: {device}")
 
     # Send events for departures
-    for device in left:
+    for device in devices_left:
         event_data = {
             "device": device,
             "action": "left",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timeout_minutes": AWAY_TIMEOUT_MINUTES,
         }
         ha_client.send_event("bluetooth_device_left", event_data)
-        logger.info(f"Device left: {device}")
+        logger.info(f"🔴 Device left: {device} (after {AWAY_TIMEOUT_MINUTES} minute timeout)")
 
-    # Update all device states
-    update_home_assistant_states(ha_client, current)
+    # Update all device states in HA
+    update_home_assistant_states(ha_client)
 
 
 def main():
     global health_status
 
     logger.info(f"Checking devices {PHONE_MACS} every 3 seconds...")
+    logger.info(f"Away timeout set to {AWAY_TIMEOUT_MINUTES} minutes")
     logger.info("Press Ctrl+C to stop")
 
     # Start health check server
@@ -231,8 +298,9 @@ def main():
             logger.info("Home Assistant integration enabled")
 
             # Initialize all devices as "off" (not present) on startup
-            initial_devices = []
-            update_home_assistant_states(ha_client, initial_devices)
+            for device in PHONE_MACS.keys():
+                device_reported_states[device] = False
+            update_home_assistant_states(ha_client)
 
         except Exception as e:
             logger.error(f"Failed to initialize Home Assistant client: {e}")
@@ -242,31 +310,31 @@ def main():
         logger.warning("HA_TOKEN not set, running without Home Assistant integration")
         health_status["ha_connected"] = False
 
-    devices_nearby = []
-    previous_devices = []
-
     # Update status to running
     health_status["status"] = "running"
 
     while True:
         try:
-            devices_nearby = devices_available()
+            # Detect currently available devices
+            detected_devices = devices_available()
 
-            if devices_nearby:
-                logger.info(f"Found {devices_nearby}")
+            if detected_devices:
+                logger.info(f"Detected devices: {detected_devices}")
             else:
-                logger.info("No devices found nearby")
+                logger.debug("No devices detected in current scan")
 
-            if previous_devices != devices_nearby:
-                logger.info(
-                    f"State change! From {previous_devices} to {devices_nearby}"
-                )
+            # Update device tracking with timeout logic
+            devices_arrived, devices_left = update_device_tracking(detected_devices)
 
-                # Update Home Assistant if client is available
+            # Handle any state changes
+            if devices_arrived or devices_left:
                 if ha_client:
-                    handle_state_change(ha_client, previous_devices, devices_nearby)
+                    handle_state_changes(ha_client, devices_arrived, devices_left)
+            else:
+                # Even if no state changes, update HA periodically to keep entities fresh
+                if ha_client:
+                    update_home_assistant_states(ha_client)
 
-            previous_devices = devices_nearby
             time.sleep(3)
 
         except KeyboardInterrupt:
@@ -276,7 +344,9 @@ def main():
             # Set all devices as "off" before exiting
             if ha_client:
                 logger.info("Setting all devices as away before exit...")
-                update_home_assistant_states(ha_client, [])
+                for device in PHONE_MACS.keys():
+                    device_reported_states[device] = False
+                update_home_assistant_states(ha_client)
 
             break
         except Exception as e:
