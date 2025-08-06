@@ -1,0 +1,16 @@
+alias: Alert - Bluetooth Detection Service Down
+description: ""
+triggers:
+  - trigger: state
+    entity_id:
+      - sensor.bluetooth_detection_service_health
+    to: unavailable
+    for:
+      hours: 0
+      minutes: 5
+      seconds: 0
+actions:
+  - data:
+      title: Bluetooth Detection Down
+      message: The bluetooth detection service has been offline for 5 minutes
+    action: notify.mobile_app_pixel_7a

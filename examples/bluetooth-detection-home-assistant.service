@@ -1,0 +1,31 @@
+[Unit]
+Description=Bluetooth Detection for Home Assistant
+After=network.target bluetooth.target
+
+[Service]
+Type=simple
+User=root
+
+# Change this to your actual development directory
+WorkingDirectory=/home/pi/your-dev-folder
+
+# Use the Python from your venv
+ExecStart=/home/your-dev-folder/venv/bin/python /home/your-dev-folder/main.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Environment variables (if you need to set any explicitly)
+Environment="PATH=/usr/bin:/usr/local/bin"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security options (optional but recommended)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
