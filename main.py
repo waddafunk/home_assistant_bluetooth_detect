@@ -180,64 +180,74 @@ def devices_available() -> List[str]:
 def update_device_tracking(detected_devices: List[str]):
     """Update device tracking with timeout logic"""
     global device_last_seen, device_reported_states
-    
+
     current_time = datetime.now()
     timeout_delta = timedelta(minutes=AWAY_TIMEOUT_MINUTES)
-    
+
     # Update last seen time for detected devices
     for device in detected_devices:
         device_last_seen[device] = current_time
-        
+
     # Initialize tracking for devices we haven't seen before
     for device in PHONE_MACS.keys():
         if device not in device_last_seen:
             # For new devices, consider them as "away" initially
-            device_last_seen[device] = current_time - timeout_delta - timedelta(seconds=1)
+            device_last_seen[device] = (
+                current_time - timeout_delta - timedelta(seconds=1)
+            )
         if device not in device_reported_states:
             device_reported_states[device] = False  # Start as away
-    
+
     # Determine current presence status for each device
     devices_to_report_present = []
     devices_to_report_away = []
-    
+
     for device in PHONE_MACS.keys():
         last_seen = device_last_seen.get(device)
-        time_since_seen = current_time - last_seen if last_seen else timeout_delta + timedelta(seconds=1)
-        
+        time_since_seen = (
+            current_time - last_seen
+            if last_seen
+            else timeout_delta + timedelta(seconds=1)
+        )
+
         # Device is considered present if detected recently
         is_currently_present = device in detected_devices
-        
+
         # Device should be reported as present if:
         # 1. It's currently detected, OR
         # 2. It was detected within the timeout period
         should_report_present = is_currently_present or time_since_seen <= timeout_delta
-        
+
         # Check if we need to update the reported state
         last_reported_state = device_reported_states.get(device, False)
-        
+
         if should_report_present and not last_reported_state:
             # Device should be marked as present (arrival)
             devices_to_report_present.append(device)
             device_reported_states[device] = True
             logger.info(f"Device {device} marked as PRESENT")
-            
+
         elif not should_report_present and last_reported_state:
             # Device should be marked as away (departure after timeout)
             devices_to_report_away.append(device)
             device_reported_states[device] = False
             time_away = time_since_seen.total_seconds() / 60  # Convert to minutes
-            logger.info(f"Device {device} marked as AWAY (not seen for {time_away:.1f} minutes)")
-            
+            logger.info(
+                f"Device {device} marked as AWAY (not seen for {time_away:.1f} minutes)"
+            )
+
         elif is_currently_present and should_report_present:
             # Device is still present (no state change needed, but log detection)
             logger.debug(f"Device {device} still present")
-            
+
         elif not should_report_present:
             # Device is still away but within timeout period
             if time_since_seen <= timeout_delta:
                 time_away = time_since_seen.total_seconds() / 60
-                logger.debug(f"Device {device} not detected for {time_away:.1f} minutes (within {AWAY_TIMEOUT_MINUTES} min timeout)")
-    
+                logger.debug(
+                    f"Device {device} not detected for {time_away:.1f} minutes (within {AWAY_TIMEOUT_MINUTES} min timeout)"
+                )
+
     return devices_to_report_present, devices_to_report_away
 
 
@@ -248,12 +258,10 @@ def update_home_assistant_states(ha_client: HomeAssistantClient):
 
 
 def handle_state_changes(
-    ha_client: HomeAssistantClient, 
-    devices_arrived: List[str], 
-    devices_left: List[str]
+    ha_client: HomeAssistantClient, devices_arrived: List[str], devices_left: List[str]
 ):
     """Handle state changes and notify Home Assistant"""
-    
+
     # Send events for arrivals
     for device in devices_arrived:
         event_data = {
@@ -274,7 +282,9 @@ def handle_state_changes(
             "timeout_minutes": AWAY_TIMEOUT_MINUTES,
         }
         ha_client.send_event("bluetooth_device_left", event_data)
-        logger.info(f"🔴 Device left: {device} (after {AWAY_TIMEOUT_MINUTES} minute timeout)")
+        logger.info(
+            f"🔴 Device left: {device} (after {AWAY_TIMEOUT_MINUTES} minute timeout)"
+        )
 
     # Update all device states in HA
     update_home_assistant_states(ha_client)
