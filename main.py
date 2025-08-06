@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Simple Bluetooth Detection Loop
-Every 3 seconds: check if device is available, print yes/no
+Every 3 seconds: check if device is available
 """
 
 import subprocess
@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Your phone's MAC address
+# Your phones MAC address
 PHONE_MACS = json.loads(os.getenv("PHONE_MACS"))
 
 
@@ -63,14 +63,22 @@ def devices_available():
 def main():
     logger.info(f"Checking devices {PHONE_MACS} every 3 seconds...")
     logger.info("Press Ctrl+C to stop")
+    
+    devices_nearby = []
+    previous_devices = []
 
     while True:
         try:
             devices_nearby = devices_available()
             if devices_nearby:
-                print(f"Found {devices_nearby}")
+                logger.info(f"Found {devices_nearby}")
             else:
-                print("No devices found nearby")
+                logger.info("No devices found nearby")
+
+            if previous_devices != devices_nearby:
+                logger.info(f"New state! From {previous_devices} to {devices_nearby}")
+
+            previous_devices = devices_nearby
 
             time.sleep(3)
 
