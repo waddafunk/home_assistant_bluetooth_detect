@@ -8,6 +8,7 @@ import subprocess
 import time
 import logging
 import os
+import json
 
 from dotenv import load_dotenv
 
@@ -21,54 +22,55 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Your phone's MAC address
-PHONE_MAC = os.getenv("PHONE_MAC")
+PHONE_MACS = json.loads(os.getenv("PHONE_MACS"))
 
 
-def is_device_available():
+def devices_available():
     """Check if device is available using l2ping"""
-    try:
-        logger.debug(f"Running: l2ping -c 1 -t 2 {PHONE_MAC}")
-        result = subprocess.run(
-            ["l2ping", "-c", "1", "-t", "2", PHONE_MAC],
-            capture_output=True,
-            timeout=3,
-            text=True,
-        )
+    devices_found = []
+    for name, address in PHONE_MACS.items():
+        try:
+            logger.debug(f"Running: l2ping -c 1 -t 2 {address}; searching for {name}")
+            result = subprocess.run(
+                ["l2ping", "-c", "1", "-t", "2", address],
+                capture_output=True,
+                timeout=3,
+                text=True,
+            )
 
-        logger.debug(f"l2ping returncode: {result.returncode}")
-        if result.stdout:
-            logger.debug(f"l2ping stdout: {result.stdout.strip()}")
-        if result.stderr:
-            logger.debug(f"l2ping stderr: {result.stderr.strip()}")
+            logger.debug(f"l2ping returncode: {result.returncode}")
+            if result.stdout:
+                logger.debug(f"l2ping stdout: {result.stdout.strip()}")
+            if result.stderr:
+                logger.debug(f"l2ping stderr: {result.stderr.strip()}")
 
-        if result.returncode == 0:
-            logger.info("Device responded to l2ping!")
-            return True
-        else:
-            logger.debug("Device did not respond to l2ping")
-            return False
+            if result.returncode == 0:
+                logger.info(f"{name} device responded to l2ping!")
+                devices_found.append(name)
+            else:
+                logger.debug("Device did not respond to l2ping")
 
-    except subprocess.TimeoutExpired:
-        logger.warning("l2ping timed out")
-        return False
-    except FileNotFoundError:
-        logger.error("l2ping command not found")
-        return False
-    except Exception as e:
-        logger.error(f"Error running l2ping: {e}")
-        return False
+        except subprocess.TimeoutExpired:
+            logger.warning("l2ping timed out")
+        except FileNotFoundError:
+            logger.error("l2ping command not found")
+        except Exception as e:
+            logger.error(f"Error running l2ping: {e}")
+
+    return devices_found
 
 
 def main():
-    logger.info(f"Checking device {PHONE_MAC} every 3 seconds...")
+    logger.info(f"Checking devices {PHONE_MACS} every 3 seconds...")
     logger.info("Press Ctrl+C to stop")
 
     while True:
         try:
-            if is_device_available():
-                print("YES")
+            devices_nearby = devices_available()
+            if devices_nearby:
+                print(f"Found {devices_nearby}")
             else:
-                print("NO")
+                print("No devices found nearby")
 
             time.sleep(3)
 
