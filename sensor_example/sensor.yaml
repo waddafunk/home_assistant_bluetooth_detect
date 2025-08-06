@@ -1,0 +1,14 @@
+# Bluetooth detection sensor healthcheck
+# Add this to your configuration.yaml to have an healthcheck sensor monitoring the service
+sensor:
+  - platform: rest
+    name: "Bluetooth Detection Service Health"
+    resource: "<YOUR_SERVICE_IP>/health"
+    value_template: "{{ 'Online' if value_json.healthy else 'Offline' }}"
+    json_attributes:
+      - status
+      - last_scan
+      - devices_found
+      - error_count
+      - uptime_seconds
+    scan_interval: 30

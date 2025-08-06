@@ -9,9 +9,13 @@ import time
 import logging
 import os
 import json
-import requests
+from datetime import datetime
 from typing import List, Dict
+
+import requests
 from dotenv import load_dotenv
+
+from healthcheck import start_health_server, health_status
 
 load_dotenv()
 
@@ -20,7 +24,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(os.getenv("APP_NAME", "Home assistant bluettoth detector"))
 
 # Your phones MAC address
 PHONE_MACS = json.loads(os.getenv("PHONE_MACS"))
@@ -32,6 +36,10 @@ HA_TOKEN = os.getenv("HA_TOKEN")  # Long-lived access token from Home Assistant
 # Home Assistant entity IDs for each device (will be created as binary_sensors)
 # Format: binary_sensor.bluetooth_device_name
 HA_ENTITY_PREFIX = "binary_sensor.bluetooth_"
+
+
+# Global status for health checks
+
 
 
 class HomeAssistantClient:
@@ -47,16 +55,20 @@ class HomeAssistantClient:
 
     def verify_connection(self):
         """Verify connection to Home Assistant"""
+        global health_status
         try:
             response = requests.get(f"{self.url}/api/", headers=self.headers, timeout=5)
             if response.status_code == 200:
                 logger.info("Successfully connected to Home Assistant")
+                health_status["ha_connected"] = True
             else:
                 logger.error(
                     f"Failed to connect to Home Assistant: {response.status_code}"
                 )
+                health_status["ha_connected"] = False
         except Exception as e:
             logger.error(f"Error connecting to Home Assistant: {e}")
+            health_status["ha_connected"] = False
 
     def update_device_state(self, device_name: str, is_present: bool):
         """Update device presence state in Home Assistant"""
@@ -118,7 +130,11 @@ class HomeAssistantClient:
 
 def devices_available() -> List[str]:
     """Check if device is available using l2ping"""
+    global health_status
     devices_found = []
+
+    health_status["last_scan"] = datetime.now()
+
     for name, address in PHONE_MACS.items():
         try:
             logger.debug(f"Running: l2ping -c 1 -t 2 {address}; searching for {name}")
@@ -138,6 +154,7 @@ def devices_available() -> List[str]:
             if result.returncode == 0:
                 logger.info(f"{name} device responded to l2ping!")
                 devices_found.append(name)
+                health_status["last_success"] = datetime.now()
             else:
                 logger.debug(f"{name} did not respond to l2ping")
 
@@ -145,9 +162,12 @@ def devices_available() -> List[str]:
             logger.warning(f"l2ping timed out for {name}")
         except FileNotFoundError:
             logger.error("l2ping command not found")
+            health_status["error_count"] += 1
         except Exception as e:
             logger.error(f"Error running l2ping for {name}: {e}")
+            health_status["error_count"] += 1
 
+    health_status["devices_found"] = devices_found
     return devices_found
 
 
@@ -195,8 +215,13 @@ def handle_state_change(
 
 
 def main():
+    global health_status
+
     logger.info(f"Checking devices {PHONE_MACS} every 3 seconds...")
     logger.info("Press Ctrl+C to stop")
+
+    # Start health check server
+    start_health_server()
 
     # Initialize Home Assistant client if configured
     ha_client = None
@@ -212,11 +237,16 @@ def main():
         except Exception as e:
             logger.error(f"Failed to initialize Home Assistant client: {e}")
             logger.info("Continuing without Home Assistant integration")
+            health_status["ha_connected"] = False
     else:
         logger.warning("HA_TOKEN not set, running without Home Assistant integration")
+        health_status["ha_connected"] = False
 
     devices_nearby = []
     previous_devices = []
+
+    # Update status to running
+    health_status["status"] = "running"
 
     while True:
         try:
@@ -241,6 +271,7 @@ def main():
 
         except KeyboardInterrupt:
             logger.info("Stopped by user")
+            health_status["status"] = "stopping"
 
             # Set all devices as "off" before exiting
             if ha_client:
@@ -250,6 +281,7 @@ def main():
             break
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
+            health_status["error_count"] += 1
             time.sleep(3)
 
 
