@@ -7,10 +7,10 @@ Type=simple
 User=root
 
 # Change this to your actual development directory
-WorkingDirectory=/home/pi/your-dev-folder
+WorkingDirectory=/home/wadda/ha_bluetooth_detect
 
 # Use the Python from your venv
-ExecStart=/home/your-dev-folder/venv/bin/python /home/your-dev-folder/main.py
+ExecStart=python /home/wadda/ha_bluetooth_detect/main.py
 
 # Restart policy
 Restart=always
