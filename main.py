@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Simple Bluetooth Detection Loop with Home Assistant Integration
-Every 3 seconds: check if device is available and update Home Assistant
+Every 30 seconds: check if device is available and update Home Assistant
 Added: AWAY_TIMEOUT feature to prevent immediate "away" status
 Enhanced: Added "everybody home" and "nobody home" binary sensors
+Improved: Using hcitool instead of l2ping for better reliability
+Added: Automatic Bluetooth adapter reset on persistent errors
 """
 
 import subprocess
@@ -26,7 +28,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(os.getenv("APP_NAME", "Home assistant bluettoth detector"))
+logger = logging.getLogger(os.getenv("APP_NAME", "Home assistant bluetooth detector"))
 
 # Your phones MAC address
 PHONE_MACS = json.loads(os.getenv("PHONE_MACS"))
@@ -37,6 +39,12 @@ HA_TOKEN = os.getenv("HA_TOKEN")  # Long-lived access token from Home Assistant
 
 # Away timeout configuration (in minutes)
 AWAY_TIMEOUT_MINUTES = int(os.getenv("AWAY_TIMEOUT", "5"))  # Default 5 minutes
+
+# Scan interval (in seconds)
+SCAN_INTERVAL = int(os.getenv("SECONDS_BETWEEN_PINGS", 30))
+
+# Bluetooth adapter reset threshold
+ERROR_THRESHOLD_FOR_RESET = int(os.getenv("BT_ERROR_THRESHOLD", "15"))
 
 # Home Assistant entity IDs for each device (will be created as binary_sensors)
 # Format: binary_sensor.bluetooth_device_name
@@ -51,6 +59,7 @@ HA_ANYBODY_HOME_ENTITY = "binary_sensor.bluetooth_anybody_home"
 # Device tracking for timeout functionality
 device_last_seen = {}  # Track when each device was last detected
 device_reported_states = {}  # Track what we last reported to HA for each device
+consecutive_scan_failures = 0  # Track consecutive failures
 
 
 class HomeAssistantClient:
@@ -94,6 +103,7 @@ class HomeAssistantClient:
                 "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "source": "bluetooth_detection",
                 "away_timeout_minutes": AWAY_TIMEOUT_MINUTES,
+                "detection_method": "hcitool",
             },
         }
 
@@ -138,11 +148,12 @@ class HomeAssistantClient:
             "present_devices": present_count,
             "present_device_list": present_devices,
             "away_timeout_minutes": AWAY_TIMEOUT_MINUTES,
+            "detection_method": "hcitool",
         }
         
         # Update everybody home sensor
         everybody_payload = {
-            "state": everybody_home,
+            "state": "on" if everybody_home else "off",
             "attributes": {
                 **common_attributes,
                 "friendly_name": "Everybody Home",
@@ -151,7 +162,7 @@ class HomeAssistantClient:
         
         # Update nobody home sensor
         nobody_payload = {
-            "state": nobody_home,
+            "state": "on" if nobody_home else "off",
             "attributes": {
                 **common_attributes,
                 "friendly_name": "Nobody Home",
@@ -160,7 +171,7 @@ class HomeAssistantClient:
         
         # Update anybody home sensor
         anybody_payload = {
-            "state": anybody_home,
+            "state": "on" if anybody_home else "off",
             "attributes": {
                 **common_attributes,
                 "friendly_name": "Anybody Home",
@@ -219,46 +230,120 @@ class HomeAssistantClient:
             return False
 
 
+def reset_bluetooth_adapter():
+    """Reset Bluetooth adapter to recover from errors"""
+    logger.warning("Resetting Bluetooth adapter...")
+    try:
+        # Bring adapter down
+        result = subprocess.run(
+            ["sudo", "hciconfig", "hci0", "down"],
+            capture_output=True,
+            timeout=5,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"Failed to bring adapter down: {result.stderr}")
+            return False
+        
+        time.sleep(2)
+        
+        # Bring adapter up
+        result = subprocess.run(
+            ["sudo", "hciconfig", "hci0", "up"],
+            capture_output=True,
+            timeout=5,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"Failed to bring adapter up: {result.stderr}")
+            return False
+        
+        time.sleep(2)
+        
+        logger.info("✓ Bluetooth adapter reset complete")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to reset Bluetooth adapter: {e}")
+        return False
+
+
+def check_bluetooth_adapter():
+    """Check if Bluetooth adapter is operational"""
+    try:
+        result = subprocess.run(
+            ["hciconfig", "hci0"],
+            capture_output=True,
+            timeout=5,
+            text=True,
+        )
+        
+        if result.returncode == 0 and "UP RUNNING" in result.stdout:
+            return True
+        else:
+            logger.warning("Bluetooth adapter not in UP RUNNING state")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error checking Bluetooth adapter: {e}")
+        return False
+
+
 def devices_available() -> List[str]:
-    """Check if device is available using l2ping"""
-    global health_status
+    """Check if devices are available using hcitool name command"""
+    global health_status, consecutive_scan_failures
     devices_found = []
+    scan_had_errors = False
 
     health_status["last_scan"] = datetime.now()
 
     for name, address in PHONE_MACS.items():
         try:
-            logger.debug(f"Running: l2ping -c 1 -t 2 {address}; searching for {name}")
+            logger.debug(f"Running: hcitool name {address}; searching for {name}")
+            
+            # hcitool name will return the device name if available, or error if not
             result = subprocess.run(
-                ["l2ping", "-c", "1", "-t", "2", address],
+                ["hcitool", "name", address],
                 capture_output=True,
-                timeout=3,
+                timeout=5,
                 text=True,
             )
 
-            logger.debug(f"l2ping returncode: {result.returncode}")
+            logger.debug(f"hcitool returncode: {result.returncode}")
             if result.stdout:
-                logger.debug(f"l2ping stdout: {result.stdout.strip()}")
+                logger.debug(f"hcitool stdout: {result.stdout.strip()}")
             if result.stderr:
-                logger.debug(f"l2ping stderr: {result.stderr.strip()}")
+                logger.debug(f"hcitool stderr: {result.stderr.strip()}")
 
-            if result.returncode == 0:
-                logger.info(f"{name} device responded to l2ping!")
+            # If we got a device name back (non-empty stdout and return code 0), device is present
+            if result.returncode == 0 and result.stdout.strip():
+                logger.info(f"✓ {name} device responded to hcitool name!")
                 devices_found.append(name)
                 health_status["last_success"] = datetime.now()
             else:
-                logger.debug(f"{name} did not respond to l2ping")
+                logger.debug(f"✗ {name} did not respond to hcitool name")
 
         except subprocess.TimeoutExpired:
-            logger.warning(f"l2ping timed out for {name}")
+            logger.warning(f"⏱ hcitool timed out for {name}")
+            scan_had_errors = True
         except FileNotFoundError:
-            logger.error("l2ping command not found")
+            logger.error("❌ hcitool command not found - is bluez-tools installed?")
             health_status["error_count"] += 1
+            scan_had_errors = True
         except Exception as e:
-            logger.error(f"Error running l2ping for {name}: {e}")
+            logger.error(f"❌ Error running hcitool for {name}: {e}")
             health_status["error_count"] += 1
+            scan_had_errors = True
+
+    # Track consecutive failures for adapter reset logic
+    if scan_had_errors:
+        consecutive_scan_failures += 1
+    else:
+        consecutive_scan_failures = 0
 
     health_status["devices_found"] = devices_found
+    health_status["consecutive_failures"] = consecutive_scan_failures
+    
     return devices_found
 
 
@@ -310,7 +395,7 @@ def update_device_tracking(detected_devices: List[str]):
             # Device should be marked as present (arrival)
             devices_to_report_present.append(device)
             device_reported_states[device] = True
-            logger.info(f"Device {device} marked as PRESENT")
+            logger.info(f"🟢 Device {device} marked as PRESENT")
 
         elif not should_report_present and last_reported_state:
             # Device should be marked as away (departure after timeout)
@@ -318,19 +403,19 @@ def update_device_tracking(detected_devices: List[str]):
             device_reported_states[device] = False
             time_away = time_since_seen.total_seconds() / 60  # Convert to minutes
             logger.info(
-                f"Device {device} marked as AWAY (not seen for {time_away:.1f} minutes)"
+                f"🔴 Device {device} marked as AWAY (not seen for {time_away:.1f} minutes)"
             )
 
         elif is_currently_present and should_report_present:
             # Device is still present (no state change needed, but log detection)
-            logger.debug(f"Device {device} still present")
+            logger.debug(f"✓ Device {device} still present")
 
         elif not should_report_present:
             # Device is still away but within timeout period
             if time_since_seen <= timeout_delta:
                 time_away = time_since_seen.total_seconds() / 60
                 logger.debug(
-                    f"Device {device} not detected for {time_away:.1f} minutes (within {AWAY_TIMEOUT_MINUTES} min timeout)"
+                    f"⏳ Device {device} not detected for {time_away:.1f} minutes (within {AWAY_TIMEOUT_MINUTES} min timeout)"
                 )
 
     return devices_to_report_present, devices_to_report_away
@@ -427,11 +512,19 @@ def handle_state_changes(
 
 
 def main():
-    global health_status
+    global health_status, consecutive_scan_failures
 
-    logger.info(f"Checking devices {PHONE_MACS} every 3 seconds...")
-    logger.info(f"Away timeout set to {AWAY_TIMEOUT_MINUTES} minutes")
+    logger.info(f"🔷 Bluetooth Detection Service Starting")
+    logger.info(f"📱 Monitoring devices: {list(PHONE_MACS.keys())}")
+    logger.info(f"⏱ Scan interval: {SCAN_INTERVAL} seconds")
+    logger.info(f"⏳ Away timeout: {AWAY_TIMEOUT_MINUTES} minutes")
+    logger.info(f"🔄 Auto-reset threshold: {ERROR_THRESHOLD_FOR_RESET} consecutive errors")
     logger.info("Press Ctrl+C to stop")
+
+    # Check Bluetooth adapter status on startup
+    if not check_bluetooth_adapter():
+        logger.warning("⚠ Bluetooth adapter not ready, attempting reset...")
+        reset_bluetooth_adapter()
 
     # Start health check server
     start_health_server()
@@ -441,7 +534,7 @@ def main():
     if HA_TOKEN:
         try:
             ha_client = HomeAssistantClient(HA_URL, HA_TOKEN)
-            logger.info("Home Assistant integration enabled")
+            logger.info("✓ Home Assistant integration enabled")
 
             # Initialize all devices as "off" (not present) on startup
             for device in PHONE_MACS.keys():
@@ -449,11 +542,11 @@ def main():
             update_home_assistant_states(ha_client)
 
         except Exception as e:
-            logger.error(f"Failed to initialize Home Assistant client: {e}")
+            logger.error(f"❌ Failed to initialize Home Assistant client: {e}")
             logger.info("Continuing without Home Assistant integration")
             health_status["ha_connected"] = False
     else:
-        logger.warning("HA_TOKEN not set, running without Home Assistant integration")
+        logger.warning("⚠ HA_TOKEN not set, running without Home Assistant integration")
         health_status["ha_connected"] = False
 
     # Update status to running
@@ -461,13 +554,24 @@ def main():
 
     while True:
         try:
+            # Check if we need to reset the Bluetooth adapter
+            if consecutive_scan_failures >= ERROR_THRESHOLD_FOR_RESET:
+                logger.warning(
+                    f"⚠ {consecutive_scan_failures} consecutive scan failures detected"
+                )
+                if reset_bluetooth_adapter():
+                    consecutive_scan_failures = 0
+                    health_status["error_count"] = 0
+                    # Wait a bit after reset before continuing
+                    time.sleep(5)
+
             # Detect currently available devices
             detected_devices = devices_available()
 
             if detected_devices:
-                logger.info(f"Detected devices: {detected_devices}")
+                logger.info(f"📍 Detected devices: {detected_devices}")
             else:
-                logger.debug("No devices detected in current scan")
+                logger.debug("🔍 No devices detected in current scan")
 
             # Update device tracking with timeout logic
             devices_arrived, devices_left = update_device_tracking(detected_devices)
@@ -481,10 +585,10 @@ def main():
                 if ha_client:
                     update_home_assistant_states(ha_client)
 
-            time.sleep(3)
+            time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
-            logger.info("Stopped by user")
+            logger.info("🛑 Stopped by user")
             health_status["status"] = "stopping"
 
             # Set all devices as "off" before exiting
@@ -496,9 +600,10 @@ def main():
 
             break
         except Exception as e:
-            logger.error(f"Unexpected error in main loop: {e}")
+            logger.error(f"❌ Unexpected error in main loop: {e}")
             health_status["error_count"] += 1
-            time.sleep(3)
+            consecutive_scan_failures += 1
+            time.sleep(SCAN_INTERVAL)
 
 
 if __name__ == "__main__":
